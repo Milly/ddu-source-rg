@@ -1,15 +1,20 @@
-import { type Denops, fn } from "https://deno.land/x/ddu_vim@v3.10.3/deps.ts";
+import {
+  type Item,
+  type ItemHighlight,
+} from "jsr:@shougo/ddu-vim@~6.1.0/types";
 import {
   BaseSource,
-  type Item,
-  type SourceOptions,
-} from "https://deno.land/x/ddu_vim@v3.10.3/types.ts";
-import type { GatherArguments } from "https://deno.land/x/ddu_vim@v3.10.3/base/source.ts";
-import { treePath2Filename } from "https://deno.land/x/ddu_vim@v3.10.3/utils.ts";
-import type { ActionData } from "https://deno.land/x/ddu_kind_file@v0.7.1/file.ts";
-import { resolve } from "https://deno.land/std@0.221.0/path/mod.ts";
-import { TextLineStream } from "https://deno.land/std@0.221.0/streams/mod.ts";
-import { ItemHighlight } from "https://deno.land/x/ddu_vim@v3.4.3/types.ts";
+  type GatherArguments,
+} from "jsr:@shougo/ddu-vim@~6.1.0/source";
+import { treePath2Filename } from "jsr:@shougo/ddu-vim@~6.1.0/utils";
+import { type ActionData } from "jsr:@shougo/ddu-kind-file@~0.9.0";
+
+import type { Denops } from "jsr:@denops/core@7";
+import * as fn from "jsr:@denops/std@7/function";
+
+import { abortable } from "jsr:@std/async@1/abortable";
+import { resolve } from "jsr:@std/path@1/resolve";
+import { TextLineStream } from "jsr:@std/streams@1/text-line-stream";
 
 const BUFFER_SIZES: readonly number[] = [
   100,
@@ -77,9 +82,10 @@ type MatchData = {
 };
 
 const LOG_HEADER = "[ddu-source-rg]";
-const log = {
-  error: console.error.bind(console, LOG_HEADER),
-};
+
+function logError(...data: unknown[]): void {
+  console.error(LOG_HEADER, ...data);
+}
 
 function kensakuQuery(denops: Denops, text: string): Promise<string> {
   return denops.dispatch("kensaku", "query", text) as Promise<string>;
@@ -90,22 +96,18 @@ function utf8Length(str: string): number {
   return utf8Encoder.encode(str).length;
 }
 
-type DisposableChildProcess = Deno.ChildProcess & {
-  [Symbol.dispose](): void;
-};
-
-function spawnDisposableChildProcess(
-  command: Deno.Command,
-): DisposableChildProcess {
-  const proc = command.spawn() as DisposableChildProcess;
-  proc[Symbol.dispose] = () => {
-    try {
-      proc.kill();
-    } catch {
-      // Prevent errors if already process closed.
-    }
-  };
-  return proc;
+function childProcessAsDisposable<T extends Deno.ChildProcess>(
+  childProcess: T,
+): T & Disposable {
+  return Object.defineProperty(childProcess, Symbol.dispose, {
+    value: () => {
+      try {
+        childProcess.kill();
+      } catch {
+        // Prevent errors if already process closed.
+      }
+    },
+  }) as T & Disposable;
 }
 
 function parseRawLine(line: string): MatchData | undefined {
@@ -142,11 +144,11 @@ function parseJsonLine(line: string): MatchData | undefined {
   };
 }
 
-class ErrorLogStream extends WritableStream {
+class ErrorLogStream<T> extends WritableStream<T> {
   constructor() {
     super({
-      write(stderr) {
-        log.error(stderr);
+      write(msg) {
+        logError(msg);
       },
     });
   }
@@ -234,90 +236,109 @@ export class Source extends BaseSource<Params> {
   override gather(
     args: GatherArguments<Params>,
   ): ReadableStream<FileItem[]> {
-    const { readable, writable } = new TransformStream<FileItem[]>();
-    this.#startGatherStream(args, writable);
-    return readable;
-  }
-
-  async #startGatherStream(
-    args: GatherArguments<Params>,
-    outputStream: WritableStream<FileItem[]>,
-  ): Promise<void> {
-    const { denops, sourceOptions, sourceParams } = args;
-
-    try {
-      const cmdPath = await fn.exepath(denops, sourceParams.cmd);
-      if (cmdPath === "") {
-        log.error(`Command not found: ${sourceParams.cmd}`);
-        return;
-      }
-
-      const input = await this.#getInput(args);
-      if (input === "") {
-        return;
-      }
-
-      const cwd = await this.#getCwd(denops, sourceOptions);
-
-      const cmdArgs = [
-        ...sourceParams.args,
-        "--",
-        input,
-        ...sourceParams.paths,
-      ];
-
-      using proc = spawnDisposableChildProcess(
-        new Deno.Command(
-          cmdPath,
-          {
-            args: cmdArgs,
-            stdout: "piped",
-            stderr: "piped",
-            stdin: "null",
-            cwd,
+    const aborter = new AbortController();
+    return new ReadableStream({
+      start: async (controller) => {
+        const { signal } = aborter;
+        const writable = new WritableStream({
+          write(items) {
+            controller.enqueue(items);
           },
-        ),
-      );
-
-      const doneErrorStream = proc.stderr
-        .pipeThrough(new TextDecoderStream())
-        .pipeThrough(new TextLineStream())
-        .pipeTo(new ErrorLogStream());
-
-      const doneOutputStream = proc.stdout
-        .pipeThrough(new TextDecoderStream())
-        .pipeThrough(new TextLineStream())
-        .pipeThrough(this.#createItemStream(sourceParams, cwd))
-        .pipeThrough(
-          new BufferStream({
-            bufferSizes: BUFFER_SIZES,
-            timeouts: BUFFER_TIMEOUTS,
-          }),
-        )
-        .pipeTo(outputStream, {
-          // Do not output internal errors to the stream.
-          preventAbort: true,
         });
-
-      await Promise.race([doneErrorStream, doneOutputStream]);
-    } catch (reason) {
-      // Logging only errors.
-      // NOTE: If canceled by ddu, `reason` is a string. (e.g. "quit")
-      if (typeof reason !== "string") {
-        log.error(reason);
-      }
-    } finally {
-      try {
-        await outputStream.close();
-      } catch {
-        // Prevent errors if it is already closed.
-      }
-    }
+        try {
+          await this.#processGatherStream(args, writable, signal);
+        } catch (reason) {
+          if (signal.aborted && reason === signal.reason) {
+            // Abort by signal, so do nothing.
+          } else {
+            // Logging only internal errors.
+            logError(reason);
+          }
+        } finally {
+          try {
+            controller.close();
+          } catch {
+            // Prevent errors if it is already closed.
+          }
+        }
+      },
+      cancel: (reason) => {
+        aborter.abort(reason);
+      },
+    });
   }
 
-  async #getInput(
+  async #processGatherStream(
     args: GatherArguments<Params>,
-  ): Promise<string> {
+    writable: WritableStream<FileItem[]>,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const { denops, sourceParams } = args;
+
+    const [
+      cmdPath,
+      input,
+      cwd,
+    ] = await abortable(
+      Promise.all([
+        fn.exepath(denops, sourceParams.cmd),
+        this.#getInput(args),
+        this.#getCwd(args),
+      ]),
+      signal,
+    );
+
+    if (cmdPath === "") {
+      logError(`Command not found: ${sourceParams.cmd}`);
+      return;
+    }
+    if (input === "") {
+      return;
+    }
+
+    const cmdArgs = [
+      ...sourceParams.args,
+      "--",
+      input,
+      ...sourceParams.paths,
+    ];
+
+    using proc = childProcessAsDisposable(
+      new Deno.Command(
+        cmdPath,
+        {
+          args: cmdArgs,
+          stdout: "piped",
+          stderr: "piped",
+          stdin: "null",
+          cwd,
+          // Do not pass the `signal` to prevent a PermissionDenied error if
+          // the child process is already closed.
+        },
+      ).spawn(),
+    );
+
+    const doneErrorStream = proc.stderr
+      .pipeThrough(new TextDecoderStream())
+      .pipeThrough(new TextLineStream())
+      .pipeTo(new ErrorLogStream(), { signal });
+
+    const doneOutputStream = proc.stdout
+      .pipeThrough(new TextDecoderStream())
+      .pipeThrough(new TextLineStream())
+      .pipeThrough(this.#createItemStream(sourceParams, cwd))
+      .pipeThrough(
+        new BufferStream({
+          bufferSizes: BUFFER_SIZES,
+          timeouts: BUFFER_TIMEOUTS,
+        }),
+      )
+      .pipeTo(writable, { signal });
+
+    await Promise.all([doneErrorStream, doneOutputStream]);
+  }
+
+  async #getInput(args: GatherArguments<Params>): Promise<string> {
     const { denops, sourceOptions, sourceParams } = args;
     const { input } = sourceOptions.volatile ? args : sourceParams;
     switch (sourceParams.inputType) {
@@ -328,15 +349,14 @@ export class Source extends BaseSource<Params> {
     }
   }
 
-  async #getCwd(denops: Denops, sourceOptions: SourceOptions): Promise<string> {
+  async #getCwd(args: GatherArguments<Params>): Promise<string> {
+    const { denops, sourceOptions } = args;
     return sourceOptions.path.length > 0
       ? treePath2Filename(sourceOptions.path)
       : await fn.getcwd(denops) as string;
   }
 
-  #getHighlightGroup(
-    sourceParams: Params,
-  ): HighlightGroup {
+  #getHighlightGroup(sourceParams: Params): HighlightGroup {
     return {
       path: "",
       lineNr: "",
@@ -395,13 +415,13 @@ export class Source extends BaseSource<Params> {
         }
 
         if (hlGroups.word && displayText && submatches) {
-          for (const { match, start } of submatches) {
+          for (const { match, start, end } of submatches) {
             if (match.text) {
               highlights.push({
                 name: "word",
                 hl_group: hlGroups.word,
-                col: 1 + headerLen + utf8Length(text.slice(0, start)),
-                width: utf8Length(match.text!),
+                col: 1 + headerLen + start,
+                width: end - start,
               });
             }
           }
