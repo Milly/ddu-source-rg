@@ -7,7 +7,6 @@ import type { Denops } from "@denops/std";
 import * as fn from "@denops/std/function";
 
 import { resolve } from "@std/path/resolve";
-import { abortable } from "@std/async/abortable";
 import { TextLineStream } from "@std/streams/text-line-stream";
 
 const enqueueSize1st = 1000;
@@ -35,16 +34,22 @@ type Params = {
   paths: string[];
 };
 
-async function* iterLine(r: ReadableStream<Uint8Array>): AsyncIterable<string> {
-  const lines = r
-    .pipeThrough(new TextDecoderStream())
-    .pipeThrough(new TextLineStream());
-
-  for await (const line of lines) {
-    if ((line as string).length) {
-      yield line as string;
-    }
-  }
+function iterLine(
+  r: ReadableStream<Uint8Array>,
+  signal?: AbortSignal,
+): ReadableStream<string> {
+  return r
+    .pipeThrough(new TextDecoderStream(), { signal })
+    .pipeThrough(new TextLineStream())
+    .pipeThrough(
+      new TransformStream<string, string>({
+        transform(chunk, controller) {
+          if (chunk.length > 0) {
+            controller.enqueue(chunk);
+          }
+        },
+      }),
+    );
 }
 
 function kensakuQuery(denops: Denops, text: string): Promise<string> {
@@ -66,6 +71,7 @@ export class Source extends BaseSource<Params> {
     input: string;
   }): ReadableStream<Item<ActionData>[]> {
     const abortController = new AbortController();
+    const { signal } = abortController;
 
     const hlGroupPath = args.sourceParams.highlights?.path ?? "";
     const hlGroupLineNr = args.sourceParams.highlights?.lineNr ?? "";
@@ -161,7 +167,7 @@ export class Source extends BaseSource<Params> {
         const input = await getInput();
 
         if (
-          input == "" ||
+          input === "" ||
           args.sourceOptions.volatile &&
             input.length < args.sourceParams.minVolatileInputLength
         ) {
@@ -193,17 +199,25 @@ export class Source extends BaseSource<Params> {
             stderr: "piped",
             stdin: "null",
             cwd,
+            signal,
           },
         ).spawn();
 
+        iterLine(proc.stderr, signal)
+          .pipeTo(
+            new WritableStream<string>({
+              write(mes: string): void {
+                console.error(mes);
+              },
+            }),
+          )
+          .catch(() => {
+            // Ignore errors
+          });
+
         let totalSize = 0;
         try {
-          for await (
-            const line of abortable(
-              iterLine(proc.stdout),
-              abortController.signal,
-            )
-          ) {
+          for await (const line of iterLine(proc.stdout, signal)) {
             if (args.sourceParams.args.includes("--json")) {
               const ret = parseJson(line, cwd);
               if (ret) {
@@ -220,9 +234,6 @@ export class Source extends BaseSource<Params> {
 
             if (totalSize >= args.sourceParams.maxEnqueSize) {
               controller.enqueue(items);
-              // Need to kill the process before return because don't exit
-              // stderr iteration until process exit.
-              proc.kill("SIGTERM");
               return;
             }
 
@@ -240,23 +251,13 @@ export class Source extends BaseSource<Params> {
             controller.enqueue(items);
           }
         } catch (e: unknown) {
-          proc.kill("SIGTERM");
-
           if (e instanceof Error && e.name.includes("AbortReason")) {
             // Ignore AbortReason errors
           } else {
             console.error(e);
           }
         } finally {
-          for await (
-            const mes of abortable(
-              iterLine(proc.stderr),
-              abortController.signal,
-            )
-          ) {
-            console.error(mes);
-          }
-
+          abortController.abort();
           controller.close();
         }
       },
